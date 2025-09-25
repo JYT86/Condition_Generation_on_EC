@@ -7,6 +7,8 @@ from tqdm import tqdm
 import logging
 
 import math
+import random
+import numpy as np
 
 import torch
 from torch import nn
@@ -61,8 +63,13 @@ class BaseTrainer(ABC):
         loss_func: str = "cross_entropy",
         time_epsilon: float = 0.0,
         diffusion_on_pad: bool = True,
+
+        # 随机数种子
+        seed :int = 42,
             
     ):
+        self._setup_seed(seed)
+
         self.rank = rank
         self.world_size = world_size
         
@@ -117,6 +124,13 @@ class BaseTrainer(ABC):
             self.logger.info(f"Flow Matching Trainer initialized with:")
             self.logger.info(f"- Scheduler: {scheduler_type} (exponent: {scheduler_exponent})")
             self.logger.info(f"- Source distribution: {source_distribution}")
+    
+    def _setup_seed(self, seed: int):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
     
     def _setup_logging(self,):
         logging.basicConfig(
@@ -246,17 +260,27 @@ class BaseTrainer(ABC):
         self.model.train()
 
         train_sampler = self.loaders.get('train_sampler', None)
-        if train_sampler:
+        if train_sampler and hasattr(train_sampler, 'set_epoch'):
             train_sampler.set_epoch(self.epoch)
+
         train_loader = self.loaders['train_loader']
 
         if self.is_main_process:
             bar = tqdm(total=len(train_loader))
 
+            current_epoch_step = self.step % len(train_loader)
+            if current_epoch_step > 0:
+                bar.update(current_epoch_step)
+
+
         total_loss = 0.0
         total_count = 0
 
+        start_batch_idx = self.step % len(train_loader)
         for batch_idx, batch in enumerate(train_loader):
+
+            if batch_idx < start_batch_idx:
+                continue
             train_info = self.train_step(batch)
             total_loss += train_info['loss']
             total_count += 1
@@ -286,7 +310,7 @@ class BaseTrainer(ABC):
             mean_loss = total_loss / total_count
 
         if self.is_main_process:
-            self.logger.info(f'Epoch {self.epoch}, mean loss: {mean_loss.item():.3f}')
+            self.logger.info(f'\nEpoch {self.epoch}, mean loss: {mean_loss.item():.3f}')
 
     def save_ckpt(self):
         """保存ckpt"""
@@ -310,6 +334,8 @@ class BaseTrainer(ABC):
 
     def load_ckpt(self, ckpt_path: Path):
         """加载ckpt"""
+        if isinstance(ckpt_path, str):
+            ckpt_path = Path(ckpt_path)
         if not ckpt_path.exists():
             if self.is_main_process:
                 self.logger.info("No checkpoint found, starting from scratch")
@@ -328,10 +354,10 @@ class BaseTrainer(ABC):
         self.step = ckpt['global_step']
         
         if self.is_main_process:
-            self.logger(f"Loaded checkpoint: epoch {self.epoch}, step {self.step}")
+            self.logger.info(f"Loaded checkpoint: epoch {self.epoch}, step {self.step}")
 
     def train(self, epochs):
-        for epoch in range(epochs):
+        for epoch in range(self.epoch, epochs):
             self.train_epoch()
 
 
