@@ -16,6 +16,7 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
+from torch.utils.tensorboard import SummaryWriter
 
 from flow_matching.path import ProbPath, MixtureDiscreteProbPath
 from flow_matching.path.scheduler import PolynomialConvexScheduler
@@ -124,6 +125,7 @@ class BaseTrainer(ABC):
             self.logger.info(f"Flow Matching Trainer initialized with:")
             self.logger.info(f"- Scheduler: {scheduler_type} (exponent: {scheduler_exponent})")
             self.logger.info(f"- Source distribution: {source_distribution}")
+            self._setup_writer()
     
     def _setup_seed(self, seed: int):
         random.seed(seed)
@@ -131,6 +133,9 @@ class BaseTrainer(ABC):
         torch.manual_seed(seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
+    
+    def _setup_writer(self,):
+        self.writer = SummaryWriter(Path('runs') / self.ckpt_dir.name)
     
     def _setup_logging(self,):
         logging.basicConfig(
@@ -288,6 +293,8 @@ class BaseTrainer(ABC):
             if self.is_main_process: 
                 bar.update(1)
                 bar.set_postfix(loss=train_info['loss'], lr=train_info['lr'])
+                self.writer.add_scalar("Loss/train", train_info['loss'], self.step)
+                self.writer.add_scalar("Lr/train", train_info['lr'], self.step)
             
             if self.step % self.save_ckpt_step == 0:
                 self.save_ckpt()
@@ -297,6 +304,7 @@ class BaseTrainer(ABC):
             
         if self.is_main_process:
             bar.close()
+            self.writer.flush()
         
         if self.world_size > 1:
             total_loss_tensor = torch.tensor([total_loss]).to(self.device)
@@ -359,6 +367,9 @@ class BaseTrainer(ABC):
     def train(self, epochs):
         for epoch in range(self.epoch, epochs):
             self.train_epoch()
+
+        if self.is_main_process:
+            self.writer.close()
 
 
 class FlowMatchingTrainer(BaseTrainer):
