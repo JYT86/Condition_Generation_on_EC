@@ -11,6 +11,7 @@ import pandas as pd
 import numpy as np
 
 from omegaconf import OmegaConf
+import time
 
 
 
@@ -18,8 +19,10 @@ def _get_brenda_data(
         file_path: str,
         if_trembl: bool = True
 ) -> Tuple[List[str], np.ndarray]:
+    start = time.perf_counter()
     print('before read csv')
     df = pd.read_csv(file_path)
+    print(f"[TIME] read_csv: {time.perf_counter() - start:.2f}s")
     if if_trembl == False:
         seqs = df[df['source']=='swiss-prot']['sequence'].tolist()
         ecs = df[df['source'] == 'swiss-prot']['label'].tolist()   
@@ -123,17 +126,21 @@ def get_datasetdict_chunked_creation(
         if_trembl: bool = None,
         chunk_size: int = 50000  # 每5万条创建一个chunk
 ):
+    total_start = time.perf_counter()
     if name == 'brenda':
         assert if_trembl is not None
         seqs, labels = _get_brenda_data(file_path, if_trembl)
     
+    start = time.perf_counter()
     train_ids, valid_ids = train_test_split(np.arange(len(seqs)), train_size=train_ratio, random_state=random_state)
+    print(f"[TIME] train/valid split: {time.perf_counter() - start:.2f}s")
     
     def create_dataset_chunked(ids, seqs, labels, split_name):
         """分块创建Dataset"""
         datasets = []
         
         for i in range(0, len(ids), chunk_size):
+            chunk_start = time.perf_counter()
             chunk_ids = ids[i:i+chunk_size]
             chunk_seqs = [seqs[idx] for idx in chunk_ids]
             chunk_labels = [labels[idx] for idx in chunk_ids]
@@ -143,14 +150,17 @@ def get_datasetdict_chunked_creation(
                 'sequence': chunk_seqs,
                 'label': chunk_labels
             })
+            print(f"[TIME] {split_name} Dataset.from_dict({len(chunk_ids)}): {time.perf_counter() - chunk_start:.2f}s")
+
             
             # 立即进行tokenization，然后释放内存
+            map_start = time.perf_counter()
             chunk_dataset = chunk_dataset.map(
                 lambda example: tokenize_single(example, max_len),
                 batched=False,
                 desc=f"Tokenizing {split_name} chunk {i//chunk_size + 1}"
             )
-            
+            print(f"[TIME] {split_name} tokenization({len(chunk_ids)}): {time.perf_counter() - map_start:.2f}s")
             datasets.append(chunk_dataset)
             print(f"{split_name}: 已完成 {min(i+chunk_size, len(ids))}/{len(ids)}")
         
@@ -181,6 +191,8 @@ def get_datasetdict_chunked_creation(
     
     print("创建验证集...")
     valid_dataset = create_dataset_chunked(valid_ids, seqs, labels, "valid")
+
+    print(f"[TIME] 总处理时间: {time.perf_counter() - total_start:.2f}s")
     
     return DatasetDict({
         'train': train_dataset,
@@ -219,10 +231,10 @@ def build_dataloaders(
     valid_sampler = DistributedSampler(ds['valid'], num_replicas=world_size, rank=rank) if distributed else None
 
     train_loader = DataLoader(
-        ds['train'], batch_size=train_batch_size, shuffle=(train_sampler is None), sampler=train_sampler 
+        ds['train'], batch_size=train_batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=8, pin_memory=True
     )
     valid_loader = DataLoader(
-        ds['valid'], batch_size=valid_batch_size, shuffle=False, sampler=valid_sampler
+        ds['valid'], batch_size=valid_batch_size, shuffle=False, sampler=valid_sampler, num_workers=8, pin_memory=True  
     )
 
     loaders = {
