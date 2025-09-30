@@ -37,6 +37,7 @@ class BaseTrainer(ABC):
         vocab_size: int,
         model: nn.Module,
         optimizer: Optimizer,
+        optimizer_kwargs: dict,
         data_name: str,
         file_path: str, 
         max_len: int,
@@ -83,7 +84,18 @@ class BaseTrainer(ABC):
                 self.model,
                 device_id=torch.device(f"cuda:{self.rank}"),
             )
-        self.optimizer = optimizer(self.model.parameters()) if isinstance(optimizer, type) else optimizer
+        if isinstance(optimizer, type):
+            kwargs = optimizer_kwargs or {}
+            self.optimizer = optimizer(self.model.parameters(), **kwargs)
+        else:
+            # if user passed an optimizer instance, re-create it bound to FSDP params
+            # (try to preserve lr if possible)
+            try:
+                # try to extract lr from existing optimizer
+                lr = optimizer.param_groups[0]['lr']
+            except Exception:
+                lr = 1e-3
+            self.optimizer = type(optimizer)(self.model.parameters(), lr=lr)
         self.loaders = build_dataloaders(
             rank, world_size, data_name, file_path, max_len, world_size > 1, batch_size, batch_size
         )
@@ -358,13 +370,15 @@ class FlowMatchingTrainer(BaseTrainer):
                 model_config=cfg.model,
                 pad_token_id=cfg.data.pad_token_id,
             )
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optim.lr)
+        optimizer_cls = torch.optim.Adam
+        optimizer_kwargs = {"lr": float(cfg.optim.lr)}
         super().__init__(
             rank=rank,
             world_size=world_size,
             vocab_size=cfg.data.vocab_size,
             model=model,
-            optimizer=optimizer,
+            optimizer=optimizer_cls, 
+            optimizer_kwargs=optimizer_kwargs,
             data_name=cfg.data.name,
             file_path=cfg.data.file_path,
             max_len=cfg.data.max_len,
