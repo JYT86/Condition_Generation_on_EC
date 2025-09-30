@@ -1,6 +1,6 @@
 data:
   name: "brenda"
-  file_path: "./dataset/temp_dataset.csv"
+  file_path: "./dataset/temp_dataset_1.csv"
   max_len: 512
   vocab_size: 21
   num_classes: 500
@@ -13,16 +13,16 @@ optim:
   warmup: 500
   n_iters: 10000
   eta_min_ratio: 0.01
-  grad_clip: 1.0
+  grad_clip: 1.0666
   accumulation_step: 4
 
 train:
-  batch_size: 4
+  batch_size: 64
   save_ckpt_step: 500
   ckpt_dir: './checkpoints'
 
 valid:
-  batch_size: 4
+  batch_size: 64
   ckpt_path: './checkpoints/ckpt_e_4_s_560500.pt'
 
 

@@ -25,6 +25,10 @@ from flow_matching.loss import MixturePathGeneralizedKL
 from data.data import build_dataloaders
 from logic.flow import SourceDistribution, MaskedSourceDistribution, UniformSourceDistribution
 from model.DiT import ConditionalDDiTlM
+from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+from torch.distributed.fsdp import StateDictType, FullStateDictConfig
+
 
 
 class BaseTrainer(ABC):
@@ -36,6 +40,7 @@ class BaseTrainer(ABC):
         vocab_size: int,
         model: nn.Module,
         optimizer: Optimizer,
+        optimizer_kwargs: dict,
         data_name: str,
         file_path: str, 
         max_len: int,
@@ -81,15 +86,24 @@ class BaseTrainer(ABC):
 
         # 分布式
         self.model = model.to(self.device)
-        self.optimizer = optimizer
         if self.world_size > 1:
-            self.model = DDP(
+            #auto_wrap_policy = size_based_auto_wrap_policy(min_num_params=1e6)
+            self.model = FSDP(
                 self.model,
-                device_ids=[self.rank],
-                output_device=self.rank,
-                find_unused_parameters=False,
+                device_id=torch.device(f"cuda:{self.rank}"),
             )
-        
+        if isinstance(optimizer, type):
+            kwargs = optimizer_kwargs or {}
+            self.optimizer = optimizer(self.model.parameters(), **kwargs)
+        else:
+            # if user passed an optimizer instance, re-create it bound to FSDP params
+            # (try to preserve lr if possible)
+            try:
+                # try to extract lr from existing optimizer
+                lr = optimizer.param_groups[0]['lr']
+            except Exception:
+                lr = 1e-3
+            self.optimizer = type(optimizer)(self.model.parameters(), lr=lr)
         self.loaders = build_dataloaders(
             rank, world_size, data_name, file_path, max_len, world_size > 1, batch_size, batch_size
         )
@@ -323,8 +337,13 @@ class BaseTrainer(ABC):
     def save_ckpt(self):
         """保存ckpt"""
         if self.is_main_process:
-            if isinstance(self.model, DDP):
-                model_state= self.model.module.state_dict()
+            if isinstance(self.model, FSDP):
+                with FSDP.state_dict_type(
+                    self.model,
+                    StateDictType.FULL_STATE_DICT,
+                    FullStateDictConfig(offload_to_cpu=True, rank0_only=True),
+                ):
+                    model_state = self.model.state_dict()
             else:
                 model_state = self.model.state_dict()
         
@@ -351,8 +370,13 @@ class BaseTrainer(ABC):
         
         ckpt = torch.load(ckpt_path, map_location=self.device)
         # 加载模型状态
-        if isinstance(self.model, DDP):
-            self.model.module.load_state_dict(ckpt['model_state_dict'])
+        if isinstance(self.model, FSDP):
+            with FSDP.state_dict_type(
+                self.model,
+                StateDictType.FULL_STATE_DICT,
+                FullStateDictConfig(offload_to_cpu=False, rank0_only=False),
+            ):
+                self.model.load_state_dict(ckpt["model_state_dict"])
         else:
             self.model.load_state_dict(ckpt['model_state_dict'])
         # 加载优化器状态
@@ -383,13 +407,15 @@ class FlowMatchingTrainer(BaseTrainer):
                 model_config=cfg.model,
                 pad_token_id=cfg.data.pad_token_id,
             )
-        optimizer = torch.optim.Adam(model.parameters(), lr=cfg.optim.lr)
+        optimizer_cls = torch.optim.Adam
+        optimizer_kwargs = {"lr": float(cfg.optim.lr)}
         super().__init__(
             rank=rank,
             world_size=world_size,
             vocab_size=cfg.data.vocab_size,
             model=model,
-            optimizer=optimizer,
+            optimizer=optimizer_cls, 
+            optimizer_kwargs=optimizer_kwargs,
             data_name=cfg.data.name,
             file_path=cfg.data.file_path,
             max_len=cfg.data.max_len,
